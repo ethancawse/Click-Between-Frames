@@ -1,11 +1,16 @@
 #pragma once
 
-#include <queue>
-#include <mutex>
+#include <bitset>
+#include <array>
+#include <atomic>
+#include <vector>
+#include <cstddef>
 
 #include <Geode/Geode.hpp>
 
 using namespace geode::prelude;
+
+using BindMask = std::array<std::bitset<256>, 6>;
 
 using TimestampType = int64_t;
 TimestampType getCurrentTimestamp();
@@ -36,21 +41,24 @@ struct Step {
 	double deltaFactor;
 	bool endStep;
 };
-
-extern std::deque<struct InputEvent> inputQueue;
-extern std::deque<struct InputEvent> inputQueueCopy;
-
-extern std::array<std::unordered_set<size_t>, 6> inputBinds;
-extern std::unordered_set<uint16_t> heldInputs;
-
-extern std::mutex inputQueueLock;
-extern std::mutex keybindsLock;
+extern std::vector<InputEvent> inputQueueCopy;
+extern std::vector<Step> stepQueue;
+extern size_t inputIdx;
+extern size_t stepIdx;
 
 extern std::atomic<bool> enableRightClick;
 // true -> cbf disabled, confusing i know
 extern std::atomic<bool> softToggle;
 
+extern BindMask g_bindMaskA;
+extern BindMask g_bindMaskB;
+extern std::atomic<BindMask*> g_bindMask;
+
+extern std::atomic<uint32_t> g_resetGen;
+
 extern bool threadPriority;
+extern bool disablePriorityBoost;
+extern bool mmcssGames;
 
 #if defined(GEODE_IS_WINDOWS)
 // some windows only global variables

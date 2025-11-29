@@ -1,15 +1,15 @@
 {
-	"geode": "4.4.0",
+	"geode": "4.10.0",
 	"gd": {
 		"win": "2.2074",
 		"android": "2.2074",
 		"mac": "2.2074",
 		"ios": "2.2074"
 	},
-	"version": "v1.4.6",
-	"id": "syzzi.click_between_frames",
-	"name": "Click Between Frames",
-	"developer": "syzzi",
+	"version": "v1.0.0",
+	"id": "3lit3hax.click_between_frames",
+	"name": "CBF Modified",
+	"developers": ["syzzi", "3lit3hax"],
 	"description": "Allows inputs to register between frames.",
 	"dependencies": {
 		"geode.custom-keybinds": {
@@ -83,6 +83,21 @@
 			"description": "Whether to automatically set CBF's thread priority to the highest available.",
 			"type": "bool",
 			"default": true,
+			"requires-restart": true,
+			"platforms": ["win"]
+		},
+		"mmcss-games": {
+			"name": "Use MMCSS (Games)",
+			"description": "Put CBF input thread into MMCSS 'Games' class (AvSetMmThreadCharacteristics).",
+			"type": "bool",
+			"default": true,
+			"platforms": ["win"]
+		},
+		"thread-priority-boost-disable": {
+			"name": "Disable Thread Priority Boost",
+			"description": "Disables Windows dynamic priority boosting for CBF's input thread (SetThreadPriorityBoost). Can improve consistency on some systems.",
+			"type": "bool",
+			"default": false,
 			"requires-restart": true,
 			"platforms": ["win"]
 		},

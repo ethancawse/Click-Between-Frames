@@ -1,5 +1,13 @@
 #include "includes.hpp"
+#include "input_ring.hpp"
 #include <geode.custom-keybinds/include/Keybinds.hpp>
+
+#ifdef GEODE_IS_WINDOWS
+#include <avrt.h>
+#pragma comment(lib, "Avrt.lib")
+#endif
+
+static std::array<uint8_t, 256> held = {};
 
 TimestampType getCurrentTimestamp() {
 	LARGE_INTEGER t;
@@ -22,63 +30,72 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 	bool inputState;
 	bool player1;
 
-	LPVOID pData;
 	switch (uMsg) {
-	case WM_INPUT: {
+		case WM_INPUT: {
+		// Read RAWINPUT with a stack buffer first (fast path).
+		RAWINPUT stackRaw{};
+		UINT size = sizeof(stackRaw);
 
-		UINT dwSize;
-		GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &dwSize, sizeof(RAWINPUTHEADER));
+		// Use a reusable thread-local buffer only if needed.
+		thread_local std::vector<BYTE> tlBuf;
 
-		auto lpb = std::unique_ptr<BYTE[]>(new BYTE[dwSize]);
-		if (!lpb) {
-			return 0;
+		RAWINPUT* raw = nullptr;
+
+		if (softToggle.load(std::memory_order_relaxed)) return 0;
+
+		static thread_local uint32_t seenGen = 0;
+		uint32_t gen = g_resetGen.load(std::memory_order_acquire);
+		if (gen != seenGen) {
+			held.fill(0);
+			seenGen = gen;
 		}
-		if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, lpb.get(), &dwSize, sizeof(RAWINPUTHEADER)) != dwSize) {
-			log::debug("GetRawInputData does not return correct size");
+
+		UINT got = GetRawInputData(
+			(HRAWINPUT)lParam,
+			RID_INPUT,
+			&stackRaw,
+			&size,
+			sizeof(RAWINPUTHEADER)
+		);
+
+		if (got == (UINT)-1) {
+			// If stack buffer wasn't enough, size now contains required bytes.
+			if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+				return 0;
+			}
+
+			tlBuf.resize(size);
+			got = GetRawInputData(
+				(HRAWINPUT)lParam,
+				RID_INPUT,
+				tlBuf.data(),
+				&size,
+				sizeof(RAWINPUTHEADER)
+			);
+			if (got == (UINT)-1) {
+				return 0;
+			}
+			raw = reinterpret_cast<RAWINPUT*>(tlBuf.data());
+		} else {
+			raw = &stackRaw;
 		}
 
-		RAWINPUT* raw = (RAWINPUT*)lpb.get();
+		// Only handle keyboard + mouse here.
 		switch (raw->header.dwType) {
-		case RIM_TYPEKEYBOARD: {
-			QueryPerformanceCounter(&time);
-
-			USHORT vkey = raw->data.keyboard.VKey;
-			inputState = raw->data.keyboard.Flags & RI_KEY_BREAK ? Release : Press;
-
-			if (vkey >= VK_NUMPAD0 && vkey <= VK_NUMPAD9) vkey -= 0x30; // make numpad numbers work with customkeybinds
-
-			// cocos2d::enumKeyCodes corresponds directly to vkeys
-			if (heldInputs.contains(vkey)) {
-				if (inputState) return 0;
-				else heldInputs.erase(vkey);
-			}
-
-			bool shouldEmplace = true;
-			player1 = true;
-
-			{
-				std::lock_guard lock(keybindsLock);
-
-				if (inputBinds[p1Jump].contains(vkey)) inputType = PlayerButton::Jump;
-				else if (inputBinds[p1Left].contains(vkey)) inputType = PlayerButton::Left;
-				else if (inputBinds[p1Right].contains(vkey)) inputType = PlayerButton::Right;
-				else {
-					player1 = false;
-					if (inputBinds[p2Jump].contains(vkey)) inputType = PlayerButton::Jump;
-					else if (inputBinds[p2Left].contains(vkey)) inputType = PlayerButton::Left;
-					else if (inputBinds[p2Right].contains(vkey)) inputType = PlayerButton::Right;
-					else shouldEmplace = false;
-				}
-			}
-
-			if (inputState) heldInputs.emplace(vkey);
-			if (!shouldEmplace) return 0;
-
-			break;
-		}
 		case RIM_TYPEMOUSE: {
-			USHORT flags = raw->data.mouse.usButtonFlags;
-			bool shouldEmplace = true;
+			const USHORT flags = raw->data.mouse.usButtonFlags;
+
+			// Only clicks matter for this mod. Ignore move/wheel/etc FAST.
+			constexpr USHORT kInteresting =
+				RI_MOUSE_BUTTON_1_DOWN | RI_MOUSE_BUTTON_1_UP |
+				RI_MOUSE_BUTTON_2_DOWN | RI_MOUSE_BUTTON_2_UP;
+
+			if ((flags & kInteresting) == 0) {
+				return 0; // does NOT block vanilla mouse move/wheel; we just don't process it here
+			}
+
+			// Timestamp only for relevant mouse button events
+			QueryPerformanceCounter(&time);
 
 			player1 = true;
 			inputType = PlayerButton::Jump;
@@ -86,33 +103,75 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 			if (flags & RI_MOUSE_BUTTON_1_DOWN) inputState = Press;
 			else if (flags & RI_MOUSE_BUTTON_1_UP) inputState = Release;
 			else {
-				player1 = false;
+				// right click -> player 2 jump if enabled
 				if (!enableRightClick.load()) return 0;
+
+				player1 = false;
 				if (flags & RI_MOUSE_BUTTON_2_DOWN) inputState = Press;
 				else if (flags & RI_MOUSE_BUTTON_2_UP) inputState = Release;
 				else return 0;
 
-				queueInMainThread([inputState]() {keybinds::InvokeBindEvent("robtop.geometry-dash/jump-p2", inputState).post();});
+				queueInMainThread([inputState]() {
+					keybinds::InvokeBindEvent("robtop.geometry-dash/jump-p2", inputState).post();
+				});
 			}
 
-			QueryPerformanceCounter(&time); // dont call on mouse move events
 			break;
 		}
+
+		case RIM_TYPEKEYBOARD: {
+			USHORT vkey = raw->data.keyboard.VKey;
+			inputState = (raw->data.keyboard.Flags & RI_KEY_BREAK) ? Release : Press;
+
+			if (vkey >= VK_NUMPAD0 && vkey <= VK_NUMPAD9) vkey -= 0x30;
+
+			if (vkey >= 256) return 0;
+
+			if (held[vkey]) {
+				if (inputState == Press) return 0;
+				held[vkey] = 0;
+			} else {
+				if (inputState == Press) held[vkey] = 1;
+			}
+
+			auto* mask = g_bindMask.load(std::memory_order_acquire);
+			bool shouldEmplace = true;
+			player1 = true;
+
+			if ((*mask)[p1Jump].test(vkey)) inputType = PlayerButton::Jump;
+			else if ((*mask)[p1Left].test(vkey)) inputType = PlayerButton::Left;
+			else if ((*mask)[p1Right].test(vkey)) inputType = PlayerButton::Right;
+			else {
+				player1 = false;
+				if ((*mask)[p2Jump].test(vkey)) inputType = PlayerButton::Jump;
+				else if ((*mask)[p2Left].test(vkey)) inputType = PlayerButton::Left;
+				else if ((*mask)[p2Right].test(vkey)) inputType = PlayerButton::Right;
+				else shouldEmplace = false;
+			}
+
+		if (!shouldEmplace) return 0;
+
+		QueryPerformanceCounter(&time);
+		break;
+	}
+
 		default:
 			return 0;
 		}
-		break;
-	}
+
+		g_inputRing.try_push(InputEvent{
+			timestampFromLarge(time),
+			inputType,
+			inputState,
+			player1
+		});
+		
+
+		return 0;
+		}
 	default:
 		return DefWindowProcA(hwnd, uMsg, wParam, lParam);
 	}
-
-	{
-		std::lock_guard lock(inputQueueLock);
-		inputQueue.emplace_back(InputEvent{ timestampFromLarge(time), inputType, inputState, player1 });
-	}
-
-	return 0;
 }
 
 void inputThread() {
@@ -145,7 +204,23 @@ void inputThread() {
 		return;
 	}
 
-	if (threadPriority) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#ifdef GEODE_IS_WINDOWS
+    HANDLE mmcssTask = nullptr;
+    DWORD mmcssTaskIndex = 0;
+
+    if (threadPriority) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+
+	if (mmcssGames) {
+		mmcssTask = AvSetMmThreadCharacteristicsW(L"Games", &mmcssTaskIndex);
+		if (mmcssTask) {
+            AvSetMmThreadPriority(mmcssTask, AVRT_PRIORITY_HIGH);
+        }
+	}
+
+	SetThreadPriorityBoost(GetCurrentThread(), disablePriorityBoost ? TRUE : FALSE);
+#endif
 
 	MSG msg;
 	while (GetMessage(&msg, hwnd, 0, 0)) {
@@ -153,8 +228,15 @@ void inputThread() {
 		while (softToggle.load()) { // reduce lag while mod is disabled
 			Sleep(2000);
 			while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)); // clear all pending messages
+			held.fill(0);
 		}
 	}
+
+#ifdef GEODE_IS_WINDOWS
+    if (mmcssTask) {
+        AvRevertMmThreadCharacteristics(mmcssTask);
+    }
+#endif
 }
 
 // notify the player if theres an issue with input on Linux
@@ -190,50 +272,57 @@ class $modify(CreatorLayer) {
 };
 
 void linuxCheckInputs() {
-	DWORD waitResult = WaitForSingleObject(hMutex, 1);
-	if (waitResult == WAIT_OBJECT_0) {
-		LinuxInputEvent* events = static_cast<LinuxInputEvent*>(pBuf);
-		for (int i = 0; i < BUFFER_SIZE; i++) {
-			if (events[i].type == 0) break; // if there are no more events
+    DWORD waitResult = WaitForSingleObject(hMutex, 1);
+    if (waitResult == WAIT_OBJECT_0) {
+        LinuxInputEvent* events = static_cast<LinuxInputEvent*>(pBuf);
 
-			InputEvent input;
-			bool player1 = true;
+        auto* mask = g_bindMask.load(std::memory_order_acquire);
 
-			USHORT scanCode = events[i].code;
-			if (scanCode == 0x3110) { // left click
-				input.inputType = PlayerButton::Jump;
-			}
-			else if (scanCode == 0x3111) { // right click
-				if (!enableRightClick.load()) continue;
-				input.inputType = PlayerButton::Jump;
-				player1 = false;
-			}
-			else {
-				USHORT keyCode = MapVirtualKeyExA(scanCode, MAPVK_VSC_TO_VK, GetKeyboardLayout(0));
-				if (inputBinds[p1Jump].contains(keyCode)) input.inputType = PlayerButton::Jump;
-				else if (inputBinds[p1Left].contains(keyCode)) input.inputType = PlayerButton::Left;
-				else if (inputBinds[p1Right].contains(keyCode)) input.inputType = PlayerButton::Right;
-				else {
-					player1 = false;
-					if (inputBinds[p2Jump].contains(keyCode)) input.inputType = PlayerButton::Jump;
-					else if (inputBinds[p2Left].contains(keyCode)) input.inputType = PlayerButton::Left;
-					else if (inputBinds[p2Right].contains(keyCode)) input.inputType = PlayerButton::Right;
-					else continue;
-				}
-			}
+        for (int i = 0; i < BUFFER_SIZE; i++) {
+            if (events[i].type == 0) break;
 
-			input.inputState = events[i].value;
-			input.time = timestampFromLarge(events[i].time);
-			input.isPlayer1 = player1;
+            InputEvent input;
+            bool player1 = true;
 
-			inputQueue.emplace_back(input);
-		}
-		ZeroMemory(events, sizeof(LinuxInputEvent[BUFFER_SIZE]));
-		ReleaseMutex(hMutex);
-	}
-	else if (waitResult != WAIT_TIMEOUT) {
-		log::error("WaitForSingleObject failed: {}", GetLastError());
-	}
+            USHORT scanCode = events[i].code;
+
+            if (scanCode == 0x3110) { // left click
+                input.inputType = PlayerButton::Jump;
+            }
+            else if (scanCode == 0x3111) { // right click
+                if (!enableRightClick.load()) continue;
+                input.inputType = PlayerButton::Jump;
+                player1 = false;
+            }
+            else {
+                USHORT keyCode = MapVirtualKeyExA(scanCode, MAPVK_VSC_TO_VK, GetKeyboardLayout(0));
+                if (keyCode >= 256) continue; // bitset is 0..255
+
+                if ((*mask)[p1Jump].test(keyCode)) input.inputType = PlayerButton::Jump;
+                else if ((*mask)[p1Left].test(keyCode)) input.inputType = PlayerButton::Left;
+                else if ((*mask)[p1Right].test(keyCode)) input.inputType = PlayerButton::Right;
+                else {
+                    player1 = false;
+                    if ((*mask)[p2Jump].test(keyCode)) input.inputType = PlayerButton::Jump;
+                    else if ((*mask)[p2Left].test(keyCode)) input.inputType = PlayerButton::Left;
+                    else if ((*mask)[p2Right].test(keyCode)) input.inputType = PlayerButton::Right;
+                    else continue;
+                }
+            }
+
+            input.inputState = events[i].value;
+            input.time = timestampFromLarge(events[i].time);
+            input.isPlayer1 = player1;
+
+            g_inputRing.try_push(std::move(input));
+        }
+
+        ZeroMemory(events, sizeof(LinuxInputEvent[BUFFER_SIZE]));
+        ReleaseMutex(hMutex);
+    }
+    else if (waitResult != WAIT_TIMEOUT) {
+        log::error("WaitForSingleObject failed: {}", GetLastError());
+    }
 }
 
 void windowsSetup() {

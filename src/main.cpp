@@ -1,6 +1,10 @@
 #include "includes.hpp"
+#include "input_ring.hpp"
 
 #include <limits>
+#include <bitset>
+#include <array>
+#include <atomic>
 
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -23,11 +27,14 @@ constexpr Step EMPTY_STEP = Step {
 	.endStep = true,
 };
 
-std::deque<struct InputEvent> inputQueue;
-std::deque<struct InputEvent> inputQueueCopy;
-std::deque<struct Step> stepQueue;
+//std::deque<struct InputEvent> inputQueue;
+std::vector<InputEvent> inputQueueCopy;
+std::vector<Step> stepQueue;
+size_t inputIdx = 0;
+size_t stepIdx = 0;
 
 std::atomic<bool> softToggle;
+std::atomic<uint32_t> g_resetGen{0};
 
 InputEvent nextInput = EMPTY_INPUT;
 
@@ -40,76 +47,138 @@ bool enableInput = false;
 bool linuxNative = false;
 bool lateCutoff; // false -> ignore inputs that happen after the start of the frame; true -> check for inputs at the latest possible moment
 
-std::array<std::unordered_set<size_t>, 6> inputBinds;
-std::unordered_set<uint16_t> heldInputs;
+//std::array<std::unordered_set<size_t>, 6> inputBinds;
 
-std::mutex inputQueueLock;
-std::mutex keybindsLock;
+BindMask g_bindMaskA{};
+BindMask g_bindMaskB{};
+std::atomic<BindMask*> g_bindMask{ &g_bindMaskA };
+
+//std::mutex inputQueueLock;
+//std::mutex keybindsLock;
 
 std::atomic<bool> enableRightClick;
 bool threadPriority;
+bool disablePriorityBoost = false;
+bool mmcssGames = true;
 
-/*
-this function copies over the inputQueue from the input thread and uses it to build a queue of physics steps
-based on when each input happened relative to the start of the frame
-(and also calculates the associated stepDelta multipliers for each step)
-*/
+static std::atomic<uint64_t> g_lastDropped{0};
+
+inline bool stepsEmpty() { return stepIdx >= stepQueue.size(); }
+inline Step const& stepsFront() { return stepQueue[stepIdx]; }
+inline void stepsPopFront() { if (!stepsEmpty()) ++stepIdx; }
+
+inline void resetInputState() {
+    firstFrame = true;
+    skipUpdate = true;
+    enableInput = true;
+
+    nextInput = EMPTY_INPUT;
+
+    inputQueueCopy.clear();
+    stepQueue.clear();
+
+    inputIdx = 0;
+    stepIdx = 0;
+
+    g_inputRing.clear();
+	g_lastDropped.store(g_inputRing.dropped(), std::memory_order_relaxed);
+	g_resetGen.fetch_add(1, std::memory_order_release);
+}
+
 void buildStepQueue(int stepCount) {
-	PlayLayer* playLayer = PlayLayer::get();
 	nextInput = EMPTY_INPUT;
-	stepQueue = {}; // shouldnt be necessary, but just in case
 
-	if (lateCutoff) { // copy all inputs in queue, use current time as the frame boundary
-		currentFrameTime = getCurrentTimestamp();
-		#ifdef GEODE_IS_WINDOWS
-		if (linuxNative) {
-			linuxCheckInputs();
-		}
-		#endif
+	stepQueue.clear();
+	inputQueueCopy.clear();
+	stepIdx = 0;
+	inputIdx = 0;
 
-		std::lock_guard lock(inputQueueLock);
-		inputQueueCopy = inputQueue;
-		inputQueue = {};
-	}
-	else { // only copy inputs that happened before the start of the frame
-		#ifdef GEODE_IS_WINDOWS
-		if (linuxNative) linuxCheckInputs();
-		#endif
+	stepQueue.reserve(stepCount * 2 + 8);
+	inputQueueCopy.reserve(256);
 
-		std::lock_guard lock(inputQueueLock);
-		while (!inputQueue.empty() && inputQueue.front().time <= currentFrameTime) {
-			inputQueueCopy.push_back(inputQueue.front());
-			inputQueue.pop_front();
-		}
-	}
+#ifdef GEODE_IS_WINDOWS
+	if (linuxNative) linuxCheckInputs();
+#endif
+
+	currentFrameTime = getCurrentTimestamp();
+
+	if (lateCutoff) {
+        InputEvent ev;
+        while (g_inputRing.try_pop(ev)) {
+            inputQueueCopy.emplace_back(std::move(ev));
+        }
+    } else {
+        const InputEvent* peek = nullptr;
+        InputEvent ev;
+        while (g_inputRing.try_peek_ptr(peek) && peek->time <= currentFrameTime) {
+            (void)g_inputRing.try_pop(ev);
+            inputQueueCopy.emplace_back(std::move(ev));
+        }
+    }
 
 	skipUpdate = false;
 	if (firstFrame) {
 		skipUpdate = true;
 		firstFrame = false;
 		lastFrameTime = currentFrameTime;
-		if (!lateCutoff) inputQueueCopy = {};
+
+		if (!lateCutoff) {
+			inputQueueCopy.clear();
+			stepQueue.clear();
+			inputIdx = 0;
+			stepIdx = 0;
+		}
 		return;
 	}
 
 	TimestampType deltaTime = currentFrameTime - lastFrameTime;
-	TimestampType stepDelta = (deltaTime / stepCount) + 1; // the +1 is to prevent dropped inputs caused by integer division
 
-	for (int i = 0; i < stepCount; i++) { // for each physics step of the frame
+	if (deltaTime <= 0 || stepCount <= 0) {
+		stepQueue.emplace_back(Step{ EMPTY_INPUT, 1.0, true });
+		lastFrameTime = currentFrameTime;
+		return;
+	}
+
+	for (int i = 0; i < stepCount; ++i) {
+		const TimestampType stepStart =
+			lastFrameTime + (deltaTime * i) / stepCount;
+
+		const TimestampType stepEnd =
+			lastFrameTime + (deltaTime * (i + 1)) / stepCount;
+
+		TimestampType stepLen = stepEnd - stepStart;
+		if (stepLen <= 0) stepLen = 1; // paranoia; usually never hits
+
 		double elapsedTime = 0.0;
-		while (!inputQueueCopy.empty()) { // while loop to account for multiple inputs on the same step
-			InputEvent front = inputQueueCopy.front();
 
-			if (front.time - lastFrameTime < stepDelta * (i + 1)) { // if the first input in the queue happened on the current step
-				double inputTime = static_cast<double>((front.time - lastFrameTime) % stepDelta) / stepDelta; // proportion of step elapsed at the time the input was made
-				stepQueue.emplace_back(Step{ front, std::clamp(inputTime - elapsedTime, SMALLEST_FLOAT, 1.0), false });
-				inputQueueCopy.pop_front();
+		while (inputIdx < inputQueueCopy.size()) {
+			auto& front = inputQueueCopy[inputIdx];
+			if (front.time < stepEnd) {
+				TimestampType t = front.time;
+				if (t < stepStart) t = stepStart;
+
+				const double inputTime = std::clamp(
+					static_cast<double>(t - stepStart) / static_cast<double>(stepLen),
+					0.0,
+					1.0
+				);
+
+				stepQueue.emplace_back(Step{
+					std::move(front),
+					std::clamp(inputTime - elapsedTime, SMALLEST_FLOAT, 1.0),
+					false
+				});
+
+				++inputIdx;
 				elapsedTime = inputTime;
-			}
-			else break; // no more inputs this step, more later in the frame
+			} else break;
 		}
 
-		stepQueue.emplace_back(Step{ EMPTY_INPUT, std::max(SMALLEST_FLOAT, 1.0 - elapsedTime), true });
+		stepQueue.emplace_back(Step{
+			EMPTY_INPUT,
+			std::max(SMALLEST_FLOAT, 1.0 - elapsedTime),
+			true
+		});
 	}
 
 	lastFrameTime = currentFrameTime;
@@ -121,21 +190,19 @@ also check if an input happened on the previous step, if so run handleButton.
 tbh this doesnt need to be a separate function from the PlayerObject::update() hook
 */
 Step popStepQueue() {
-	if (stepQueue.empty()) return EMPTY_STEP;
+	if (stepIdx >= stepQueue.size()) return EMPTY_STEP;
 
-	Step front = stepQueue.front();
-	double deltaFactor = front.deltaFactor;
+	Step front = std::move(stepQueue[stepIdx++]);
 
 	if (nextInput.time != 0) {
-		PlayLayer* playLayer = PlayLayer::get();
-
-		enableInput = true;
-		playLayer->handleButton(nextInput.inputState, (int)nextInput.inputType, nextInput.isPlayer1);
-		enableInput = false;
+		if (auto* playLayer = PlayLayer::get()) {
+			enableInput = true;
+			playLayer->handleButton(nextInput.inputState, (int)nextInput.inputType, nextInput.isPlayer1);
+			enableInput = false;
+		}
 	}
 
 	nextInput = front.input;
-	stepQueue.pop_front();
 
 	return front;
 }
@@ -146,33 +213,40 @@ Step popStepQueue() {
 send list of keybinds to the input thread
 */
 void updateKeybinds() {
-	std::array<std::unordered_set<size_t>, 6> binds;
-	std::vector<geode::Ref<keybinds::Bind>> v;
+    BindMask tmp;
+    for (auto& b : tmp) b.reset();
 
-	enableRightClick.store(Mod::get()->getSettingValue<bool>("right-click"));
+    std::vector<geode::Ref<keybinds::Bind>> v;
+    enableRightClick.store(Mod::get()->getSettingValue<bool>("right-click"));
 
-	v = keybinds::BindManager::get()->getBindsFor("robtop.geometry-dash/jump-p1");
-	for (int i = 0; i < v.size(); i++) binds[p1Jump].emplace(v[i]->getHash());
+	static std::atomic<bool> s_warnedBadHash{false};
+	size_t skipped = 0;
 
-	v = keybinds::BindManager::get()->getBindsFor("robtop.geometry-dash/move-left-p1");
-	for (int i = 0; i < v.size(); i++) binds[p1Left].emplace(v[i]->getHash());
+    auto addBinds = [&](int action, const char* id) {
+        v = keybinds::BindManager::get()->getBindsFor(id);
+        for (auto& bind : v) {
+            auto hk = static_cast<size_t>(bind->getHash());
+            if (hk < 256) tmp[action].set(hk);
+			else skipped++;
+        }
+    };
 
-	v = keybinds::BindManager::get()->getBindsFor("robtop.geometry-dash/move-right-p1");
-	for (int i = 0; i < v.size(); i++) binds[p1Right].emplace(v[i]->getHash());
+    addBinds(p1Jump,  "robtop.geometry-dash/jump-p1");
+    addBinds(p1Left,  "robtop.geometry-dash/move-left-p1");
+    addBinds(p1Right, "robtop.geometry-dash/move-right-p1");
+    addBinds(p2Jump,  "robtop.geometry-dash/jump-p2");
+    addBinds(p2Left,  "robtop.geometry-dash/move-left-p2");
+    addBinds(p2Right, "robtop.geometry-dash/move-right-p2");
 
-	v = keybinds::BindManager::get()->getBindsFor("robtop.geometry-dash/jump-p2");
-	for (int i = 0; i < v.size(); i++) binds[p2Jump].emplace(v[i]->getHash());
-
-	v = keybinds::BindManager::get()->getBindsFor("robtop.geometry-dash/move-left-p2");
-	for (int i = 0; i < v.size(); i++) binds[p2Left].emplace(v[i]->getHash());
-
-	v = keybinds::BindManager::get()->getBindsFor("robtop.geometry-dash/move-right-p2");
-	for (int i = 0; i < v.size(); i++) binds[p2Right].emplace(v[i]->getHash());
-
-	{
-		std::lock_guard lock(keybindsLock);
-		inputBinds = binds;
+	if (skipped && !s_warnedBadHash.exchange(true)) {
+    	log::warn("CBF: ignored {} keybind hashes >= 256 (those binds won't work with current mask).", skipped);
 	}
+
+    // publish swap (no mutex needed)
+    BindMask* cur = g_bindMask.load(std::memory_order_relaxed);
+    BindMask* next = (cur == &g_bindMaskA) ? &g_bindMaskB : &g_bindMaskA;
+    *next = std::move(tmp);
+    g_bindMask.store(next, std::memory_order_release);
 }
 #endif
 
@@ -255,63 +329,55 @@ class $modify(PlayLayer) {
 
 bool mouseFix;
 
-void onFrameStart() {
-	PlayLayer* playLayer = PlayLayer::get();
-	CCNode* par;
+void onFramePrePoll() {
+	const uint64_t d = g_inputRing.dropped();
+    const uint64_t prev = g_lastDropped.load(std::memory_order_relaxed);
 
-	if (!lateCutoff) {
-		currentFrameTime = getCurrentTimestamp();
+	if (d != prev) {
+		g_lastDropped.store(d, std::memory_order_relaxed);
+
+		resetInputState();
+
+		log::warn("CBF: input ring dropped events, total = {}", d);
 	}
 
-	if (softToggle.load() // CBF disabled
-	#ifdef GEODE_IS_WINDOWS
-		|| !GetFocus() // GD is minimized
-	#endif
-		|| !playLayer // not in level
-		|| !(par = playLayer->getParent()) // must be a real playLayer with a parent (for compatibility with mods that use a fake playLayer)
-		|| (par->getChildByType<PauseLayer>(0)) // if paused
-		|| (playLayer->getChildByType<EndLevelLayer>(0))) // if on endscreen
-	{
-		firstFrame = true;
-		skipUpdate = true;
-		enableInput = true;
+    PlayLayer* playLayer = PlayLayer::get();
+    CCNode* par;
 
-		inputQueueCopy = {};
+    if (softToggle.load()
+    #ifdef GEODE_IS_WINDOWS
+        || !GetFocus()
+    #endif
+        || !playLayer
+        || !(par = playLayer->getParent())
+        || (par->getChildByType<PauseLayer>(0))
+        || (playLayer->getChildByType<EndLevelLayer>(0)))
+    {
+        resetInputState();
+    }
 
-		if (!linuxNative) { // clearing the queue isnt necessary on Linux since its fixed size anyway, but on Windows memory leaks are possible
-			std::lock_guard lock(inputQueueLock);
-			inputQueue = {};
-		}
-	}
-	#ifdef GEODE_IS_WINDOWS
-	if (mouseFix && !skipUpdate) { // reduce lag with high polling rate mice by limiting the number of mouse movements per frame to 1
-		MSG msg;
-		int index = 1;
-		while (PeekMessage(&msg, NULL, WM_MOUSEFIRST + index, WM_MOUSELAST, PM_NOREMOVE)) { // check for mouse inputs in the queue
-			if (msg.message == WM_MOUSEMOVE || msg.message == WM_NCMOUSEMOVE) {
-				PeekMessage(&msg, NULL, WM_MOUSEFIRST + index, WM_MOUSELAST, PM_REMOVE); // remove mouse movements from queue
-			}
-			else index++;
-		}
-	}
-	#endif
+    #ifdef GEODE_IS_WINDOWS
+    if (mouseFix && !skipUpdate) {
+        MSG msg;
+        while (PeekMessage(&msg, NULL, WM_MOUSEMOVE,   WM_MOUSEMOVE,   PM_REMOVE)) {}
+		while (PeekMessage(&msg, NULL, WM_NCMOUSEMOVE, WM_NCMOUSEMOVE, PM_REMOVE)) {}
+    }
+    #endif
 }
 
 #ifdef GEODE_IS_WINDOWS
 #include <Geode/modify/CCEGLView.hpp>
 class $modify(CCEGLView) {
-	void pollEvents() {
-		onFrameStart();
-
-		CCEGLView::pollEvents();
-	}
+    void pollEvents() {
+        onFramePrePoll();
+        CCEGLView::pollEvents();
+    }
 };
 #else
 #include <Geode/modify/CCScheduler.hpp>
 class $modify(CCScheduler) {
 	void update(float dt) {
-		onFrameStart();
-
+		onFramePrePoll();
 		CCScheduler::update(dt);
 	}
 };
@@ -341,9 +407,7 @@ class $modify(GJBaseGameLayer) {
 			stepCount = calculateStepCount(modifiedDelta, timewarp, false);
 
 			if (pl->m_playerDied || GameManager::sharedState()->getEditorLayer() || softToggle.load()) {
-				enableInput = true;
-				skipUpdate = true;
-				firstFrame = true;
+				resetInputState();
 			}
 			else if (modifiedDelta > 0.0) buildStepQueue(stepCount);
 			else skipUpdate = true;
@@ -354,9 +418,9 @@ class $modify(GJBaseGameLayer) {
 	}
 
 	void processCommands(float p0) {
-		if (clickOnSteps && !stepQueue.empty()) {
+		if (clickOnSteps && stepIdx < stepQueue.size()) {
 			Step step;
-			do step = popStepQueue(); while (!stepQueue.empty() && !step.endStep); // process 1 step (or more if theres an input)
+			do step = popStepQueue(); while ((stepIdx < stepQueue.size()) && !step.endStep); // process 1 step (or more if theres an input)
 		}
 		GJBaseGameLayer::processCommands(p0);
 	}
@@ -399,8 +463,10 @@ class $modify(PlayerObject) {
 			return; 
 		}
 
-		inputThisStep = stepQueue.empty() ? false : !stepQueue.front().endStep;
-		if (!stepQueue.empty() && !inputThisStep && !clickOnSteps) stepQueue.pop_front();
+		inputThisStep = (stepIdx < stepQueue.size()) ? !stepQueue[stepIdx].endStep : false;
+		if ((stepIdx < stepQueue.size()) && !inputThisStep && !clickOnSteps) {
+			++stepIdx;
+		}
 		
 		if (skipUpdate
 			|| !pl
@@ -637,6 +703,10 @@ $on_mod(Loaded) {
 	});
 
 	threadPriority = Mod::get()->getSettingValue<bool>("thread-priority");
+
+	mmcssGames = Mod::get()->getSettingValue<bool>("mmcss-games");
+
+	disablePriorityBoost = Mod::get()->getSettingValue<bool>("thread-priority-boost-disable");
 
 #ifdef GEODE_IS_WINDOWS
 	(void) Mod::get()->hook(
