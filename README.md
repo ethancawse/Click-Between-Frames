@@ -1,6 +1,30 @@
-# Installation
+# Summary of Fork Changelog
 
-Install [Geode](https://geode-sdk.org/install/), then install this mod from the Geode index.
+* NOTE - ONLY SUPPORTED ON WINDOWS
+* The mod now uses a faster input pipeline that stays consistent during lag, high polling mice, or high system load. This allows for higher input reliability.
+* Lower overhead per frame and input, reducing lag spikes, allowing for increased performance.
+* Entering/exiting levels, pausing, dying, minimizing, or disabling the mod properly resets everything to prevent leftover inputs. This allows for safter behavior/stability if something goes wrong.
+* Keybind checks are now faster and more lightweight, so custom binds should feel snappier overall (NOTE: Some weird binds may not be supported).
+* Added extra Windows thread scheduling/priority options that can improve input consistency on some systems. This should help overall stability/consistency.
+* Click-between-frames behavior, physics bypass interaction, safe mode/validity rules, and the endscreen indicators all work the same at a user level (no gameplay changes).
+
+# Changelog
+
+* Replaced the old mutex + `std::deque` input queue with a lock-free single-producer/single-consumer ring buffer for lower overhead and more consistent input handling under load.
+* Switched internal buffers to `std::vector` + index cursors (instead of pop-front deques) to reduce allocations and improve cache efficiency.
+* Added a unified “hard reset” path that fully resets CBF state (queues, indices, nextInput, held keys, etc.) when leaving a valid play state (pause/endscreen/minimize/death/editor/disable).
+* Added dropped-input detection: if the ring buffer ever overflows, the mod automatically resets state and logs a warning instead of continuing with potentially desynced timing.
+* Reworked step slicing math to use exact per-step `[start,end)` bounds (no `+1` fudge factor / modulo-based timing), improving determinism and clarity of substep timing.
+* Updated keybind handling to an atomic, double-buffered `bitset<256>` mask system (no mutexes) for very fast key lookups.
+* Added a one-time warning when keybind hashes exceed 255 (those binds are ignored with the current bitmask approach).
+* Optimized Windows RAWINPUT handling: stack-buffer fast path, thread-local fallback only when needed, and early-out filtering for non-click mouse events to reduce processing cost on high polling devices.
+* Improved key repeat filtering using a simple fixed-size “held key” array and reset-generation syncing to prevent stuck/duplicated states after resets.
+* Simplified and strengthened the optional mouse-move queue trimming (WM_MOUSEMOVE / WM_NCMOUSEMOVE removal) to reduce input lag spikes on high polling mice.
+* Added optional MMCSS “Games” scheduling for the input thread (with high MMCSS priority) for more stable capture under system load.
+* Added an option to control Windows thread priority boost behavior for the input thread (toggleable).
+* Reduced overhead while the mod is disabled by throttling the input thread and clearing pending messages/held states during soft-toggle.
+* Unified Linux/Wine input ingestion to use the same bind-mask + ring-buffer pipeline as Windows for consistent behavior across platforms.
+* Preserved core gameplay behavior and compatibility logic (CBF input injection model, buffered-input fallback behavior, physics bypass handling, watermarking, safe mode / leaderboard validity rules).
 
 # What does it do
 
