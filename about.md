@@ -7,7 +7,7 @@ This is an experimental modified version of syzzi’s Click Between Frames Fix. 
 # What does it do
 
 This mod allows your inputs to register in between visual frames, which drastically increases input precision on low framerates like 60FPS. \
-It's similar to TPS Bypass or Draw Divide, but with much less lag and (hopefully) far fewer physics-related bugs. Optimized by 3lit3hax.
+It's similar to TPS Bypass or Draw Divide, but with much less lag and (hopefully) far fewer physics-related bugs.
 
 If you like the mod, please consider [donating](https://www.paypal.com/donate/?hosted_button_id=U2LWN9H395TF8)!
 

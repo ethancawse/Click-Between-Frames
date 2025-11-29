@@ -231,8 +231,6 @@ void inputThread() {
 #endif
 
 	MSG msg;
-
-	
 	while (GetMessage(&msg, hwnd, 0, 0)) {
 #ifdef GEODE_IS_WINDOWS
 		if (msg.message == WM_INPUT) {
