@@ -5,6 +5,8 @@
 #ifdef GEODE_IS_WINDOWS
 #include <avrt.h>
 #pragma comment(lib, "Avrt.lib")
+static thread_local LARGE_INTEGER g_wmInputQpc{};
+static thread_local bool g_hasWmInputQpc = false;
 #endif
 
 static std::array<uint8_t, 256> held = {};
@@ -42,6 +44,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 		RAWINPUT* raw = nullptr;
 
 		if (softToggle.load(std::memory_order_relaxed)) return 0;
+		
+#ifdef GEODE_IS_WINDOWS
+    if (g_hasWmInputQpc) {
+        time = g_wmInputQpc;
+		g_hasWmInputQpc = false;
+    } else {
+		QueryPerformanceCounter(&time); // fallback
+	}
+#else
+	QueryPerformanceCounter(&time);
+#endif
 
 		static thread_local uint32_t seenGen = 0;
 		uint32_t gen = g_resetGen.load(std::memory_order_acquire);
@@ -93,9 +106,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 			if ((flags & kInteresting) == 0) {
 				return 0; // does NOT block vanilla mouse move/wheel; we just don't process it here
 			}
-
-			// Timestamp only for relevant mouse button events
-			QueryPerformanceCounter(&time);
 
 			player1 = true;
 			inputType = PlayerButton::Jump;
@@ -150,8 +160,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 			}
 
 		if (!shouldEmplace) return 0;
-
-		QueryPerformanceCounter(&time);
 		break;
 	}
 
@@ -223,7 +231,18 @@ void inputThread() {
 #endif
 
 	MSG msg;
+
+	
 	while (GetMessage(&msg, hwnd, 0, 0)) {
+#ifdef GEODE_IS_WINDOWS
+		if (msg.message == WM_INPUT) {
+			QueryPerformanceCounter(&g_wmInputQpc);
+			g_hasWmInputQpc = true;
+		} else {
+			g_hasWmInputQpc = false;
+		}
+#endif
+
 		DispatchMessage(&msg);
 		while (softToggle.load()) { // reduce lag while mod is disabled
 			Sleep(2000);
